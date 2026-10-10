@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#00875a">
+<title>Bara ER Night Shift</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- START -->
+  <section id="screen-start" class="screen active scroll">
+    <div class="start-inner">
+      <div class="logo">
+        <div class="cross">✚</div>
+        <h1>BARA ER</h1>
+        <p class="sub">Night Shift Triage</p>
+      </div>
+      <div class="ecg-wrap big"><svg class="ecg" viewBox="0 0 240 36" preserveAspectRatio="none"><path d="M0 20H30L36 14L42 20H52L56 26L62 2L68 34L72 20H90L98 15L108 20H150L156 14L162 20H172L176 26L182 2L188 34L192 20H210L218 15L228 20H240"/></svg></div>
+      <p class="intro">A 12-hour night in a Soweto trauma unit, squeezed into <b>60 seconds</b>. Patients keep arriving. Read their vitals and swipe each one to the right room before they crash.</p>
+
+      <div class="legend">
+        <div class="lg lg-resus"><b>RESUS / ICU</b><span>Critical: treat now</span></div>
+        <div class="lg lg-ward"><b>WARD</b><span>Urgent: treat within 1–2 h</span></div>
+        <div class="lg lg-wait"><b>WAITING</b><span>Minor: no doctor needed</span></div>
+      </div>
+
+      <div class="night-card">
+        <div class="night-pick">
+          <button class="icon-btn dark" id="btn-prev" aria-label="Previous night">◀</button>
+          <div class="night-title">NIGHT <b id="start-night">1</b></div>
+          <button class="icon-btn dark" id="btn-next" aria-label="Next night">▶</button>
+        </div>
+        <ul id="start-features" class="features"></ul>
+      </div>
+
+      <button id="btn-start" class="btn primary">Start shift</button>
+      <button id="btn-rules" class="btn ghost">How to triage</button>
+      <p class="disclaimer">A game inspired by trauma care at Chris Hani Baragwanath Hospital. Simplified rules: this is not medical training.</p>
+    </div>
+  </section>
+
+  <!-- RULES -->
+  <section id="screen-rules" class="screen scroll">
+    <div class="start-inner rules">
+      <h2>How to triage</h2>
+      <p>Every patient card shows four signs. Each sign has three steps: <b>fine</b>, <b>worrying</b> or <b>critical</b>. The <b>worst</b> sign decides the room. Several worrying signs still don't make a critical one.</p>
+
+      <table class="signs">
+        <thead><tr><th></th><th>Fine</th><th class="w">Worrying</th><th class="c">Critical</th></tr></thead>
+        <tbody>
+          <tr><td>❤️ Pulse</td><td>Normal</td><td class="w">Fast</td><td class="c">Racing</td></tr>
+          <tr><td>🩸 BP</td><td>Normal</td><td class="w">Low</td><td class="c">Very low</td></tr>
+          <tr><td>🧠 Awake</td><td>Alert</td><td class="w">Drowsy</td><td class="c">Unconscious</td></tr>
+          <tr><td>💨 Breathing</td><td>Easy</td><td class="w">Hard</td><td class="c">Failing</td></tr>
+        </tbody>
+      </table>
+
+      <div class="rule rule-resus">
+        <h3>RESUS / ICU: treat now</h3>
+        <ul>
+          <li>Any <b>critical</b> sign</li>
+          <li>A <b>torso wound</b> (chest or belly) with a <b>fast</b> pulse. It means hidden bleeding inside.</li>
+        </ul>
+      </div>
+      <div class="rule rule-ward">
+        <h3>WARD: treat when there's time</h3>
+        <ul>
+          <li>Any <b>worrying</b> sign</li>
+          <li>A <b>torso wound</b> or <b>major injury</b>, even if all signs are fine</li>
+        </ul>
+      </div>
+      <div class="rule rule-wait">
+        <h3>WAITING: no doctor needed</h3>
+        <ul><li>All signs fine and a minor injury</li></ul>
+      </div>
+
+      <h3>Watch out</h3>
+      <ul class="plain">
+        <li>The bar under each card is <b>stability</b>. Critical patients crash fastest.</li>
+        <li>Resus has <b>3 beds</b> and Ward has <b>4</b>. A minor patient in a Resus bed can block the next gunshot victim.</li>
+        <li>Sending a patient to a room <b>below</b> what they need usually kills them. Sending them <b>higher</b> wastes a bed, but they survive.</li>
+        <li>Survive <b>80%</b> of a night to unlock the next one. Later nights bring more patients, mass casualties and patients who get worse. Colour hints go away. Injuries can mislead: a "bullet graze" may be harmless, while someone who says "I feel fine" may be bleeding inside. Trust the signs, not the story.</li>
+      </ul>
+      <button id="btn-rules-back" class="btn primary">Got it</button>
+    </div>
+  </section>
+
+  <!-- GAME -->
+  <section id="screen-game" class="screen">
+    <header class="hud">
+      <div class="hud-row">
+        <div class="hud-night">NIGHT <b id="hud-night">1</b></div>
+        <div class="hud-clock" id="hud-clock">20:00</div>
+        <div class="hud-stats">
+          <span>🚑 <b id="hud-arrived">0</b>/<b id="hud-total">0</b></span>
+          <span class="hud-dead">✝ <b id="hud-dead">0</b></span>
+        </div>
+        <button class="icon-btn" id="btn-sound" aria-label="Sound">🔇</button>
+        <button class="icon-btn" id="btn-pause" aria-label="Pause">⏸</button>
+      </div>
+      <div class="ecg-wrap"><svg class="ecg" viewBox="0 0 240 36" preserveAspectRatio="none"><path d="M0 20H30L36 14L42 20H52L56 26L62 2L68 34L72 20H90L98 15L108 20H150L156 14L162 20H172L176 26L182 2L188 34L192 20H210L218 15L228 20H240"/></svg></div>
+      <div class="timebar"><div id="hud-time"></div></div>
+    </header>
+
+    <div class="bay" id="bay">
+      <span class="siren"></span>
+      <span class="ticker" id="ticker">Ambulance bay quiet…</span>
+      <span class="door" id="door"></span>
+    </div>
+
+    <div class="lobby-wrap">
+      <div id="lobby" class="lobby"></div>
+      <div id="banner" class="banner"></div>
+    </div>
+
+    <div class="rooms">
+      <div class="room room-resus" data-room="resus">
+        <div class="room-head"><b>RESUS / ICU</b><small>Treat now</small><span class="full-tag">FULL</span></div>
+        <div class="room-rule">Any <b class="rc">red</b> sign · torso wound + fast pulse</div>
+        <div class="beds" id="beds-resus"></div>
+      </div>
+      <div class="room room-ward" data-room="ward">
+        <div class="room-head"><b>WARD</b><small>When time</small><span class="full-tag">FULL</span></div>
+        <div class="room-rule">Any <b class="rw">orange</b> sign · torso wound · major injury</div>
+        <div class="beds" id="beds-ward"></div>
+      </div>
+      <div class="room room-wait" data-room="waiting">
+        <div class="room-head"><b>WAITING</b><small>No doctor</small></div>
+        <div class="room-rule">All signs fine · minor injury</div>
+        <div class="waiting-box"><div class="waiting-count" id="waiting-count">0</div><div class="waiting-people" id="waiting-people"></div></div>
+      </div>
+    </div>
+
+    <div class="overlay" id="pause">
+      <div class="overlay-box">
+        <h2>Paused</h2>
+        <button class="btn primary" id="btn-resume">Resume</button>
+        <button class="btn ghost" id="btn-quit">Quit to menu</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- RESULTS -->
+  <section id="screen-results" class="screen">
+    <div class="res-head">
+      <div class="res-night" id="res-night">NIGHT 1 · 08:00</div>
+      <div class="res-big" id="res-big">0/0</div>
+      <div class="res-sub">survived the night</div>
+      <div class="res-bar"><div id="res-bar"></div><span class="res-pass"></span></div>
+      <div class="res-grade" id="res-grade"></div>
+      <div class="res-chips" id="res-chips"></div>
+    </div>
+    <ul class="res-list scroll" id="res-list"></ul>
+    <div class="res-actions">
+      <div class="res-next" id="res-next"></div>
+      <button class="btn primary" id="btn-continue">Next night</button>
+      <button class="btn ghost" id="btn-menu">Menu</button>
+    </div>
+  </section>
+
+</div>
+<script src="data.js"></script>
+<script src="input.js"></script>
+<script src="game.js"></script>
+</body>
+</html>
