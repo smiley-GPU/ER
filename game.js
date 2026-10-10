@@ -9,9 +9,18 @@ const ROOMS = {
 };
 const CAT_RANK = { red: 2, orange: 1, green: 0 };
 const CAT_ROOM = { red: 'resus', orange: 'ward', green: 'waiting' };
-const DRAIN = { red: 6, orange: 2.4, green: 0.7 };   // stability lost per second while waiting
-const QUEUE_DRAIN = 1.5;                            // waiting outside the door is worse
-const TREAT = { resus: 10, ward: 7 };               // seconds a bed stays occupied, whoever is in it
+
+// Hidden stability (0–100). The player never sees the number: it shows through signs getting
+// worse, the beating heart on the card and the monitor alarm.
+const DRAIN = { red: 3.6, orange: 1.5, green: 0.25 };  // per second while untreated in the lobby
+const QUEUE_DRAIN = 1.5;           // stuck outside the door
+const WRONG_ROOM_DRAIN = 1.15;     // in a room that can't treat them: nobody is watching closely
+const WORSEN_AT = [66, 40];        // stability levels where one sign gets worse
+const ALARM_AT = 28;
+const TREAT_TIME = { resus: 14, ward: 10 };       // seconds with a solid (2-star) doctor
+const SKILL_SPEED = [0, 0.75, 1, 1.4];            // by doctor skill 1–3
+const SKILL_CARE = [0, 0.55, 0.3, 0.12];          // stability drain multiplier during treatment
+const GO_HOME_AFTER = 12;          // minor patients in Waiting leave after this many seconds
 
 const Store = {
   get(k, d) {
@@ -19,6 +28,30 @@ const Store = {
   },
   set(k, v) { try { localStorage.setItem('baraER.' + k, JSON.stringify(v)); } catch (_) { /* storage unavailable */ } },
 };
+
+/* ---------------- saved progress ---------------- */
+
+function defaultSave() {
+  const doctors = {};
+  for (const d of DOCTORS) doctors[d.id] = { hired: !!d.start, skills: { ...d.skills } };
+  return { unlocked: 1, funds: 0, beds: { ...BASE_BEDS }, analysis: 0, doctors, team: { resus: 'naidoo', ward: 'khumalo' } };
+}
+
+function loadSave() {
+  const d = defaultSave();
+  const s = Store.get('save', null);
+  if (!s) return d;
+  return { ...d, ...s, beds: { ...d.beds, ...s.beds }, doctors: { ...d.doctors, ...s.doctors }, team: { ...d.team, ...s.team } };
+}
+
+let S = loadSave();
+function save() { Store.set('save', S); }
+
+const docDef = (id) => DOCTORS.find((d) => d.id === id);
+const skillOf = (docId, area) => S.doctors[docId].skills[area];
+const stars = (n) => '★'.repeat(n) + '☆'.repeat(3 - n);
+
+/* ---------------- sound ---------------- */
 
 const Sound = {
   on: Store.get('sound', false),
@@ -44,26 +77,31 @@ const Sound = {
   },
   arrive() { this.tone(960, 0.11, 'square', 0.025); this.tone(720, 0.11, 'square', 0.025, 0.12); },
   place() { this.tone(660, 0.08, 'sine', 0.07); this.tone(990, 0.06, 'sine', 0.05, 0.06); },
+  saved() { this.tone(880, 0.1, 'sine', 0.05); this.tone(1320, 0.14, 'sine', 0.04, 0.09); },
   reject() { this.tone(140, 0.22, 'sawtooth', 0.05); },
+  worse() { this.tone(520, 0.1, 'triangle', 0.05); this.tone(390, 0.14, 'triangle', 0.05, 0.1); },
   death() { this.tone(440, 1.0, 'sine', 0.06); },
   alarm() { for (let i = 0; i < 6; i++) this.tone(i % 2 ? 700 : 950, 0.16, 'square', 0.035, i * 0.18); },
 };
 
 function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (_) { /* unsupported */ } }
 
+/* ---------------- game state ---------------- */
+
 const G = {
-  night: 1, unlocked: Store.get('night', 1), cfg: null, state: 'menu',
-  t: 0, last: 0, patients: [], schedule: [], lobby: [], queue: [], slotEls: [],
+  night: S.unlocked, cfg: null, forecast: null, state: 'menu',
+  t: 0, last: 0, overtime: false, patients: [], schedule: [], lobby: [], queue: [], slotEls: [],
   beds: { resus: [], ward: [] }, waiting: [], selected: null, dead: 0, arrived: 0, announced: new Set(),
+  roomsDirty: true, placedCount: 0, earned: 0,
 };
-G.night = G.unlocked;
 
 /* ---------------- patient generation ---------------- */
 
 function weightedCause() {
   const keys = Object.keys(CAUSES);
-  let r = Math.random() * keys.reduce((s, k) => s + CAUSES[k].weight, 0);
-  for (const k of keys) { r -= CAUSES[k].weight; if (r <= 0) return k; }
+  const w = (k) => CAUSES[k].weight * (G.forecast.boost[k] || 1);
+  let r = Math.random() * keys.reduce((s, k) => s + w(k), 0);
+  for (const k of keys) { r -= w(k); if (r <= 0) return k; }
   return keys[0];
 }
 
@@ -72,15 +110,25 @@ function sampleCat(mix) {
   return r < mix.red ? 'red' : r < mix.red + mix.orange ? 'orange' : 'green';
 }
 
-// Arrivals peak around midnight (22:00–02:00 = 10–30 s).
+// Arrivals peak around midnight.
 function arrivalTimes(n) {
-  const w = (t) => 1 + 1.3 * Math.exp(-((t - 20) ** 2) / (2 * 9 * 9));
+  const peak = ROUND_SECONDS * 0.33;
+  const sd = ROUND_SECONDS * 0.15;
+  const w = (t) => 1 + 1.3 * Math.exp(-((t - peak) ** 2) / (2 * sd * sd));
   const times = [];
   while (times.length < n) {
-    const t = 0.8 + Math.random() * 56;
+    const t = 0.8 + Math.random() * (ROUND_SECONDS - 6);
     if (Math.random() * 2.3 < w(t)) times.push(t);
   }
   return times.sort((a, b) => a - b);
+}
+
+function hiddenSigns(cfg) {
+  if (Math.random() >= cfg.hiddenChance) return [];
+  let n = ri(1, cfg.hiddenMax);
+  if (S.analysis >= 2) n--;
+  if (S.analysis >= 3) n = 0;
+  return shuffle(VITALS.map((d) => d.k)).slice(0, Math.max(n, 0));
 }
 
 function makePatient(cfg, at, ev) {
@@ -95,23 +143,27 @@ function makePatient(cfg, at, ev) {
   const inj = pick(opts);
   if (!inj.cats.includes(target)) target = pick(inj.cats);
   const vitals = genVitals(target, inj, tricky);
-  const truth = triage(vitals, inj);
   const male = Math.random() < 0.85;
   return {
-    id: 0, at, cause, inj, vitals, truth, tricky,
+    id: 0, at, cause, inj, area: areaOf(inj), vitals, truth: triage(vitals, inj), tricky,
     name: pick(male ? NAMES_M : NAMES_F), sex: male ? 'M' : 'F', age: ri(17, 58),
-    stab: 100, status: 'pending', slot: -1, room: null, burst: ev ? ev.label : null,
-    canDeteriorate: truth === 'orange' && Math.random() < cfg.deteriorate, deteriorated: false,
+    hidden: hiddenSigns(cfg), revealT: ANALYSIS[S.analysis].reveal,
+    s: 100, worsenIdx: 0, worsened: false, loc: null, bed: -1, slot: -1, progress: 0,
+    outcome: null, where: null, firstRoom: null, firstNeed: null, over: false, burst: ev ? ev.label : null,
   };
 }
 
 function generatePatients(cfg) {
   const events = [];
-  for (let b = 0; b < cfg.bursts; b++) events.push({ ...pick(MASS_EVENTS), at: 10 + Math.random() * 38 });
+  const pool = MASS_EVENTS.filter((e) => G.forecast.boost[e.cause]);
+  for (let b = 0; b < cfg.bursts; b++) {
+    const ev = pool.length && Math.random() < 0.7 ? pick(pool) : pick(MASS_EVENTS);
+    events.push({ ...ev, at: ROUND_SECONDS * (0.15 + Math.random() * 0.6) });
+  }
   const burstTotal = events.reduce((s, e) => s + e.size, 0);
   const list = arrivalTimes(Math.max(cfg.patients - burstTotal, 4)).map((t) => makePatient(cfg, t));
   for (const ev of events) {
-    for (let i = 0; i < ev.size; i++) list.push(makePatient(cfg, ev.at + i * 0.45, ev));
+    for (let i = 0; i < ev.size; i++) list.push(makePatient(cfg, ev.at + i * 0.5, ev));
   }
   list.sort((a, b) => a.at - b.at).forEach((p, i) => { p.id = i; });
   return list;
@@ -124,6 +176,7 @@ function showScreen(name) {
 }
 function roomEl(room) { return document.querySelector(`.room[data-room="${room}"]`); }
 function restartAnim(el, cls) { el.classList.remove(cls); void el.offsetWidth; el.classList.add(cls); }
+function fmtMin(m) { m = Math.floor(m); return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}`; }
 
 function ticker(msg) {
   $('#ticker').textContent = msg;
@@ -141,31 +194,45 @@ function buildCard(p) {
   const el = document.createElement('div');
   el.className = 'card';
   el.dataset.id = p.id;
+  el.dataset.drag = '';
   const tags = (p.inj.pen ? '<em>TORSO WOUND</em>' : '') + (p.inj.major ? '<em>MAJOR INJURY</em>' : '');
   el.innerHTML = `
-    <div class="c-top"><span class="c-ico">${CAUSES[p.cause].icon}</span><span class="c-inj">${p.inj.name}</span></div>
+    <div class="c-top"><span class="c-ico">${CAUSES[p.cause].icon}</span><span class="c-inj">${p.inj.name}</span><span class="c-wait"></span><span class="c-heart">❤</span></div>
     <div class="c-meta"><span>${p.name}, ${p.age}${p.sex}</span>${tags}</div>
     <div class="c-vit">
       ${VITALS.map((d) => `<div class="vt" data-k="${d.k}"><i>${d.icon} ${d.label}</i><b></b></div>`).join('')}
-    </div>
-    <div class="c-bar"><div class="c-fill"></div></div>`;
+    </div>`;
   p.el = el;
-  p.barEl = el.querySelector('.c-fill');
+  p.heartEl = el.querySelector('.c-heart');
+  p.waitEl = el.querySelector('.c-wait');
   updateVitals(p);
   return el;
+}
+
+function buildToken(p) {
+  const t = document.createElement('div');
+  t.className = 'tok';
+  t.dataset.id = p.id;
+  t.dataset.drag = '';
+  t.innerHTML = `<span>${CAUSES[p.cause].icon}</span>`;
+  p.tok = t;
+  return t;
 }
 
 function updateVitals(p, flash) {
   for (const d of VITALS) {
     const val = p.vitals[d.k];
     const cell = p.el.querySelector(`.vt[data-k="${d.k}"]`);
+    const unknown = p.hidden.includes(d.k);
+    const word = unknown ? '? measuring' : d.words[val];
     const old = cell.lastElementChild.textContent;
-    cell.lastElementChild.textContent = d.words[val];
-    const lvl = G.cfg.hints > 0 ? vitalLevel(d.k, val, p.inj) : '';
+    cell.lastElementChild.textContent = word;
+    const lvl = G.cfg.hints > 0 && !unknown ? vitalLevel(d.k, val, p.inj) : '';
     cell.classList.toggle('warn', lvl === 'warn');
     cell.classList.toggle('crit', lvl === 'crit');
-    cell.classList.toggle('bad', val > 0);
-    if (flash && old !== d.words[val]) restartAnim(cell, 'changed');
+    cell.classList.toggle('bad', !unknown && val > 0);
+    cell.classList.toggle('unknown', unknown);
+    if (flash && old !== word) restartAnim(cell, 'changed');
   }
 }
 
@@ -182,20 +249,25 @@ function buildGameDom() {
   for (const r of ['resus', 'ward']) {
     const c = $('#beds-' + r);
     c.innerHTML = '';
+    c.style.setProperty('--cols', G.beds[r].length > 4 ? 3 : 2);
     G.beds[r].forEach(() => { const b = document.createElement('div'); b.className = 'bed'; c.appendChild(b); });
     roomEl(r).classList.remove('full');
+    const doc = docDef(S.team[r]);
+    $('#doc-' + r).textContent = doc.name;
   }
-  $('#waiting-count').textContent = '0';
-  $('#waiting-people').textContent = '';
+  $('#waiting-list').innerHTML = '';
   const game = $('#screen-game');
-  game.classList.remove('hints-0', 'hints-1', 'hints-2', 'armed');
+  game.classList.remove('hints-0', 'hints-1', 'hints-2', 'armed', 'overtime');
   game.classList.add('hints-' + G.cfg.hints);
   $('#hud-night').textContent = G.night;
   $('#hud-total').textContent = G.patients.length;
   $('#ticker').textContent = 'Shift starts. Ambulance bay quiet…';
   $('#door').classList.remove('show');
+  $('#btn-handover').classList.remove('show');
   $('#pause').classList.remove('show');
-  document.querySelectorAll('.card.ghost, .card.flying').forEach((e) => e.remove());
+  $('#inspect').classList.remove('show');
+  $('#inspect-card').innerHTML = '';
+  document.querySelectorAll('.ghost.card, .ghost.tok, .flying').forEach((e) => e.remove());
 }
 
 /* ---------------- round flow ---------------- */
@@ -204,19 +276,22 @@ function startNight() {
   Sound.ensure();
   G.cfg = nightConfig(G.night);
   G.t = 0;
+  G.overtime = false;
   G.patients = generatePatients(G.cfg);
   G.schedule = G.patients.slice();
   G.lobby = new Array(LOBBY_SLOTS).fill(null);
   G.queue = [];
-  G.beds = { resus: new Array(G.cfg.resusBeds).fill(null), ward: new Array(G.cfg.wardBeds).fill(null) };
+  G.beds = { resus: new Array(S.beds.resus).fill(null), ward: new Array(S.beds.ward).fill(null) };
   G.waiting = [];
   G.selected = null;
   G.dead = 0;
   G.arrived = 0;
+  G.placedCount = 0;
   G.announced = new Set();
+  G.roomsDirty = true;
   buildGameDom();
   showScreen('game');
-  banner(`NIGHT ${G.night}`, describeNight(G.cfg).slice(0, 2).join(' · '), true);
+  banner(`NIGHT ${G.night}`, G.forecast.title, true);
   G.state = 'play';
   G.last = performance.now();
   requestAnimationFrame(frame);
@@ -226,13 +301,36 @@ function frame(now) {
   if (G.state !== 'play') return;
   const dt = Math.min(Math.max((now - G.last) / 1000, 0), 0.1);
   G.last = now;
+  step(dt);
+  if (G.state === 'play') requestAnimationFrame(frame);
+}
+
+function step(dt) {
   G.t += dt;
   while (G.schedule.length && G.schedule[0].at <= G.t) arrive(G.schedule.shift());
-  tickPatients(dt);
-  tickBeds(dt);
+  if (!G.overtime && G.t >= ROUND_SECONDS) startOvertime();
+  tick(dt);
   render();
-  if (G.t >= ROUND_SECONDS) { endNight(); return; }
-  requestAnimationFrame(frame);
+  if (G.overtime) checkHandover();
+}
+
+function startOvertime() {
+  G.overtime = true;
+  $('#screen-game').classList.add('overtime');
+  banner('08:00 · OVERTIME', 'No new arrivals. Finish every patient who came in tonight.', true);
+  ticker('Overtime: place everyone still waiting, then hand over.');
+}
+
+function pendingInLobby() {
+  return G.queue.length > 0 || G.lobby.some((p) => p && !p.outcome);
+}
+
+function checkHandover() {
+  const ready = !pendingInLobby();
+  $('#btn-handover').classList.toggle('show', ready);
+  if (!ready) return;
+  const busy = G.beds.resus.some(Boolean) || G.beds.ward.some(Boolean) || G.waiting.some((p) => p.truth !== 'green');
+  if (!busy) endNight();
 }
 
 function arrive(p) {
@@ -247,14 +345,16 @@ function arrive(p) {
     Sound.arrive();
   }
   ticker(`🚑 Incoming: ${CAUSES[p.cause].icon} ${p.inj.name}`);
+  p.arrivedAt = G.t;
   buildCard(p);
+  buildToken(p);
   const slot = G.lobby.indexOf(null);
   if (slot >= 0) putInSlot(p, slot);
-  else { p.status = 'queue'; G.queue.push(p); }
+  else { p.loc = 'queue'; G.queue.push(p); }
 }
 
 function putInSlot(p, slot) {
-  p.status = 'lobby';
+  p.loc = 'lobby';
   p.slot = slot;
   G.lobby[slot] = p;
   G.slotEls[slot].appendChild(p.el);
@@ -268,123 +368,212 @@ function freeSlot(slot) {
   if (next) putInSlot(next, slot);
 }
 
-function tickPatients(dt) {
-  for (const p of G.lobby) {
-    if (!p) continue;
-    if (p.status === 'dying') {
+/* ---------------- simulation ---------------- */
+
+function isTreating(p) {
+  return (p.loc === 'resus' || p.loc === 'ward') && ROOMS[p.loc].rank >= CAT_RANK[p.truth];
+}
+
+function tick(dt) {
+  for (const p of G.patients) {
+    if (!p.loc) continue;
+    if (p.dyingT !== undefined) {
       p.dyingT -= dt;
-      if (p.dyingT <= 0) { p.status = 'died'; freeSlot(p.slot); }
+      if (p.dyingT <= 0) { delete p.dyingT; G.lobby[p.slot] = null; p.loc = null; freeSlot(p.slot); }
       continue;
     }
-    drain(p, dt, 1);
+    if (p.outcome) continue;
+
+    if (p.hidden.length) {
+      p.revealT -= dt;
+      if (p.revealT <= 0) {
+        p.hidden.shift();
+        p.revealT = ANALYSIS[S.analysis].reveal;
+        updateVitals(p, true);
+      }
+    }
+
+    const base = DRAIN[p.truth] * G.cfg.drain;
+    if (isTreating(p)) {
+      const skill = skillOf(S.team[p.loc], p.area);
+      p.progress += dt * 100 * SKILL_SPEED[skill] / TREAT_TIME[p.loc];
+      p.s -= base * SKILL_CARE[skill] * dt;
+      if (p.progress >= 100) { finishTreatment(p); continue; }
+    } else {
+      let mult = 1;
+      if (p.loc === 'queue') mult = QUEUE_DRAIN;
+      else if (p.loc === 'waiting') mult = p.truth === 'green' ? 0 : WRONG_ROOM_DRAIN;
+      else if (p.loc !== 'lobby') mult = WRONG_ROOM_DRAIN;
+      p.s -= base * mult * dt;
+      while (p.worsenIdx < WORSEN_AT.length && p.s < WORSEN_AT[p.worsenIdx]) { p.worsenIdx++; worsen(p); }
+    }
+
+    if (p.loc === 'waiting' && p.truth === 'green') {
+      p.homeT -= dt;
+      if (p.homeT <= 0) { goHome(p); continue; }
+    }
+    if (p.s <= 0) die(p);
   }
-  for (const p of G.queue.slice()) drain(p, dt, QUEUE_DRAIN);
 }
 
-function drain(p, dt, mult) {
-  p.stab -= DRAIN[p.truth] * G.cfg.drain * mult * dt;
-  if (p.canDeteriorate && !p.deteriorated && p.stab < 55) deteriorate(p);
-  if (p.stab <= 0) die(p);
-}
-
-function deteriorate(p) {
-  p.deteriorated = true;
-  worsenVitals(p.vitals);
+function worsen(p) {
+  if (!worsenOnce(p.vitals, p.inj)) return;
   p.truth = triage(p.vitals, p.inj);
   updateVitals(p, true);
-  const meta = p.el.querySelector('.c-meta');
-  meta.insertAdjacentHTML('beforeend', '<em class="warnflag">⚠ WORSE</em>');
-  if (p.status === 'lobby') ticker(`⚠ ${p.name} is deteriorating!`);
+  if (!p.worsened) {
+    p.worsened = true;
+    p.el.querySelector('.c-meta').insertAdjacentHTML('beforeend', '<em class="warnflag">⚠ WORSE</em>');
+  }
+  if (p.loc !== 'queue') {
+    ticker(`⚠ ${p.name} is getting worse${p.loc === 'lobby' ? '' : ' in ' + ROOMS[p.loc].label}!`);
+    Sound.worse();
+  }
+}
+
+// Take the patient out of wherever they are. The caller decides where they go next.
+function removeFromLocation(p) {
+  if (p.loc === 'lobby') freeSlot(p.slot);
+  else if (p.loc === 'queue') G.queue.splice(G.queue.indexOf(p), 1);
+  else if (p.loc === 'resus' || p.loc === 'ward') G.beds[p.loc][p.bed] = null;
+  else if (p.loc === 'waiting') G.waiting.splice(G.waiting.indexOf(p), 1);
+  if (p.loc !== 'lobby' && p.loc !== 'queue') G.roomsDirty = true;
+  p.loc = null;
+}
+
+function detachToken(p, cls) {
+  const t = p.tok;
+  if (!t || !t.isConnected) return;
+  const r = t.getBoundingClientRect();
+  Object.assign(t.style, { position: 'fixed', left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', margin: 0 });
+  t.classList.add('leaving', cls);
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 1000);
+}
+
+function finishTreatment(p) {
+  p.outcome = 'saved';
+  p.where = p.loc;
+  p.doctor = S.team[p.loc];
+  p.over = ROOMS[p.loc].rank > CAT_RANK[p.truth];
+  if (G.selected === p) select(null);
+  Input.cancelIf(p.id);
+  detachToken(p, 'ok');
+  removeFromLocation(p);
+  Sound.saved();
+}
+
+function goHome(p) {
+  p.outcome = 'saved';
+  p.where = 'home';
+  if (G.selected === p) select(null);
+  Input.cancelIf(p.id);
+  detachToken(p, 'ok');
+  removeFromLocation(p);
 }
 
 function die(p) {
-  p.stab = 0;
+  p.s = 0;
+  p.outcome = 'died';
+  p.where = p.loc;
+  p.needAtDeath = p.truth;
   G.dead++;
   Sound.death();
   buzz(220);
   if (G.selected === p) select(null);
   Input.cancelIf(p.id);
-  if (p.status === 'queue') {
-    G.queue.splice(G.queue.indexOf(p), 1);
-    p.status = 'died';
-    p.diedAtDoor = true;
+  if (p.loc === 'queue') {
+    removeFromLocation(p);
+    p.where = 'door';
     ticker(`✝ ${p.name} died outside. No space in the lobby.`);
     return;
   }
-  p.status = 'dying';
-  p.dyingT = 1.1;
-  p.el.classList.remove('critical', 'selected');
-  p.el.classList.add('dead');
-  ticker(`✝ ${p.name} died in the lobby`);
+  if (p.loc === 'lobby') {
+    p.dyingT = 1.1;                       // card stays in its slot briefly, greyed out
+    p.el.classList.remove('critical', 'selected');
+    p.el.classList.add('dead');
+    ticker(`✝ ${p.name} died in the lobby`);
+    return;
+  }
+  ticker(`✝ ${p.name} died in ${ROOMS[p.loc].label}`);
+  if (p.loc !== 'waiting') p.doctor = S.team[p.loc];
+  detachToken(p, 'dead');
+  removeFromLocation(p);
 }
 
-function tickBeds(dt) {
-  for (const r of ['resus', 'ward']) {
-    G.beds[r].forEach((b, i) => {
-      if (!b) return;
-      b.left -= dt;
-      if (b.left <= 0) G.beds[r][i] = null;
-    });
-  }
-}
+/* ---------------- player actions ---------------- */
 
 function select(p) {
-  if (G.selected && G.selected.el) G.selected.el.classList.remove('selected');
+  if (G.selected) {
+    if (G.selected.el) G.selected.el.classList.remove('selected');
+    if (G.selected.tok) G.selected.tok.classList.remove('selected');
+  }
   G.selected = p;
-  if (p) p.el.classList.add('selected');
+  const inspect = $('#inspect');
+  const holder = $('#inspect-card');
+  holder.innerHTML = '';
+  inspect.classList.remove('show');
+  if (p) {
+    p.el.classList.add('selected');
+    p.tok.classList.add('selected');
+    if (p.loc !== 'lobby') {
+      holder.appendChild(p.el);
+      inspect.classList.add('show');
+      renderInspect();
+    }
+  }
   $('#screen-game').classList.toggle('armed', !!p);
 }
 
-function place(p, room, srcEl) {
-  if (!p || p.status !== 'lobby' || G.state !== 'play') return false;
+function move(p, room, srcEl) {
+  if (!p || p.outcome || p.dyingT !== undefined || G.state !== 'play') return false;
+  if (!['lobby', 'resus', 'ward', 'waiting'].includes(p.loc) || p.loc === room) return false;
+  let bed = -1;
   if (room !== 'waiting') {
-    const i = G.beds[room].indexOf(null);
-    if (i < 0) {
+    bed = G.beds[room].indexOf(null);
+    if (bed < 0) {
       restartAnim(roomEl(room), 'shake');
-      ticker(`⛔ ${ROOMS[room].label} is full. Wait for a free bed.`);
+      ticker(`⛔ ${ROOMS[room].label} is full. Wait for a free bed or move someone out.`);
       Sound.reject();
       buzz(60);
       return false;
     }
-    const total = TREAT[room];
-    G.beds[room][i] = { p, left: total, total };
-  } else {
-    G.waiting.push(p);
-    $('#waiting-count').textContent = G.waiting.length;
-    $('#waiting-people').textContent = '🧍'.repeat(Math.min(G.waiting.length, 12));
   }
-  p.status = 'placed';
-  p.room = room;
-  p.placeStab = p.stab;
-  p.placeTruth = p.truth;
+  flyTo(srcEl || (p.loc === 'lobby' ? p.el : p.tok), room, !!srcEl);
   if (G.selected === p) select(null);
-  const fly = srcEl || p.el;
-  flyTo(fly, room);
-  if (fly !== p.el) p.el.remove();
-  freeSlot(p.slot);
+  if (p.el.parentNode) p.el.remove();
+  removeFromLocation(p);
+  if (!p.firstRoom) { p.firstRoom = room; p.firstNeed = p.truth; G.placedCount++; }
+  p.loc = room;
+  p.progress = 0;
+  if (room === 'waiting') { G.waiting.push(p); p.homeT = GO_HOME_AFTER; } else { G.beds[room][bed] = p; p.bed = bed; }
+  G.roomsDirty = true;
   restartAnim(roomEl(room), 'got');
   Sound.place();
   buzz(15);
   return true;
 }
 
-function flyTo(el, room) {
+// Animate a copy (or the disposable drag ghost) flying into the room.
+function flyTo(el, room, disposable) {
   const r = el.getBoundingClientRect();
   const t = roomEl(room).getBoundingClientRect();
-  el.classList.remove('selected', 'enter', 'dragging', 'ghost', 'returning', 'critical');
-  el.classList.add('flying');
-  Object.assign(el.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', transform: 'none' });
-  document.body.appendChild(el);
-  void el.offsetWidth;
+  const f = disposable ? el : el.cloneNode(true);
+  f.classList.remove('selected', 'enter', 'dragging', 'ghost', 'returning', 'critical');
+  f.classList.add('flying');
+  Object.assign(f.style, { left: r.left + 'px', top: r.top + 'px', width: r.width + 'px', height: r.height + 'px', transform: 'none' });
+  document.body.appendChild(f);
+  void f.offsetWidth;
   const dx = t.left + t.width / 2 - (r.left + r.width / 2);
   const dy = t.top + t.height / 2 - (r.top + r.height / 2);
-  el.style.transform = `translate(${dx}px, ${dy}px) scale(.15)`;
-  el.style.opacity = '0';
-  setTimeout(() => el.remove(), 340);
+  f.style.transform = `translate(${dx}px, ${dy}px) scale(.15)`;
+  f.style.opacity = '0';
+  setTimeout(() => f.remove(), 340);
 }
 
+/* ---------------- rendering ---------------- */
+
 function render() {
-  const mins = SHIFT_START_MIN + Math.min(G.t, ROUND_SECONDS) * GAME_MIN_PER_SEC;
+  const mins = SHIFT_START_MIN + G.t * GAME_MIN_PER_SEC;
   const h = Math.floor(mins / 60) % 24;
   const m = Math.floor(mins % 60);
   $('#hud-clock').textContent = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
@@ -392,42 +581,60 @@ function render() {
   $('#hud-arrived').textContent = G.arrived;
   $('#hud-dead').textContent = G.dead;
 
-  let critical = false;
-  for (const p of G.lobby) {
-    if (!p || p.status !== 'lobby') continue;
-    const s = Math.max(p.stab, 0);
-    p.barEl.style.width = s + '%';
-    p.barEl.style.backgroundColor = `hsl(${Math.round(s * 1.5)}, 80%, 38%)`;
-    const crit = s < 35;
+  let alarm = false;
+  const visible = G.lobby.filter((p) => p && !p.outcome);
+  if (G.selected && !visible.includes(G.selected)) visible.push(G.selected);
+  for (const p of visible) {
+    const crit = p.s < ALARM_AT;
     p.el.classList.toggle('critical', crit);
-    critical = critical || crit;
+    alarm = alarm || crit;
+    const beat = crit ? 0.32 : [1.1, 0.7, 0.45][p.vitals.pulse];
+    if (p.beat !== beat) { p.beat = beat; p.heartEl.style.animationDuration = beat + 's'; }
+    p.waitEl.textContent = `⏱ ${fmtMin((G.t - p.arrivedAt) * GAME_MIN_PER_SEC)}`;
   }
-  $('.hud').classList.toggle('alarm', critical || G.queue.length > 0);
 
   const door = $('#door');
   door.classList.toggle('show', G.queue.length > 0);
   door.textContent = `🚑 ×${G.queue.length} at door`;
 
+  if (G.roomsDirty) layoutRooms();
+  for (const p of G.patients) {
+    if (!p.tok || !(p.loc === 'resus' || p.loc === 'ward' || p.loc === 'waiting')) continue;
+    p.tok.style.setProperty('--p', isTreating(p) ? p.progress.toFixed(1) : 0);
+    const crit = p.s < ALARM_AT;
+    p.tok.classList.toggle('alarm', crit);
+    alarm = alarm || crit;
+  }
+  $('.hud').classList.toggle('alarm', alarm || G.queue.length > 0);
+
+  renderInspect();
+}
+
+function renderInspect() {
+  if (G.selected && G.selected.loc && G.selected.loc !== 'lobby') {
+    const p = G.selected;
+    const where = ROOMS[p.loc].label;
+    const status = p.loc === 'waiting' ? 'no doctor here'
+      : `${docDef(S.team[p.loc]).name} · treatment ${Math.round(isTreating(p) ? p.progress : 0)}%`;
+    $('#inspect-cap').textContent = `In ${where}: ${status}. Tap another room to move.`;
+  }
+}
+
+function layoutRooms() {
+  G.roomsDirty = false;
   for (const r of ['resus', 'ward']) {
     const els = $('#beds-' + r).children;
-    G.beds[r].forEach((b, i) => {
+    G.beds[r].forEach((p, i) => {
       const el = els[i];
-      if (b) {
-        if (el.dataset.pid !== String(b.p.id)) {
-          el.dataset.pid = b.p.id;
-          el.className = 'bed occ';
-          el.innerHTML = `<span>${CAUSES[b.p.cause].icon}</span>`;
-          restartAnim(el, 'in');
-        }
-        el.style.setProperty('--p', (100 * (1 - b.left / b.total)).toFixed(1));
-      } else if (el.dataset.pid) {
-        delete el.dataset.pid;
-        el.className = 'bed';
-        el.innerHTML = '';
-      }
+      if (p) { if (p.tok.parentNode !== el) { el.innerHTML = ''; el.appendChild(p.tok); restartAnim(p.tok, 'in'); } }
+      else if (el.firstChild) el.innerHTML = '';
+      el.classList.toggle('occ', !!p);
     });
     roomEl(r).classList.toggle('full', !G.beds[r].includes(null));
   }
+  const list = $('#waiting-list');
+  for (const p of G.waiting) if (p.tok.parentNode !== list) { list.appendChild(p.tok); restartAnim(p.tok, 'in'); }
+  for (const t of [...list.children]) if (!G.waiting.some((p) => p.tok === t)) t.remove();
 }
 
 function pause() {
@@ -445,167 +652,302 @@ function resume() {
   requestAnimationFrame(frame);
 }
 
-/* ---------------- outcome ---------------- */
+/* ---------------- end of shift ---------------- */
 
-// The sign that decided where the patient belonged, in plain words.
-function keySign(p) {
-  const v = p.vitals;
-  const crit = VITALS.find((d) => v[d.k] === 2);
-  if (crit) return `${crit.label} ${crit.words[2].toLowerCase()}`;
-  if (p.inj.pen && v.pulse >= 1) return 'Torso wound + fast pulse';
-  const warn = VITALS.find((d) => v[d.k] === 1);
-  if (warn) return `${warn.label} ${warn.words[1].toLowerCase()}`;
-  if (p.inj.pen) return 'Torso wound';
-  if (p.inj.major) return 'Major injury';
-  return 'All signs fine';
-}
-
-function evaluate(p) {
-  const need = p.status === 'placed' ? p.placeTruth : p.truth;
-  const r = { p, need, survived: false, kind: '', why: '' };
-  const needLabel = `${ROOMS[CAT_ROOM[need]].label} (${keySign(p).toLowerCase()})`;
-
-  if (p.status === 'died' || p.status === 'dying') {
-    r.kind = 'lost';
-    r.why = p.diedAtDoor ? 'Died outside. The lobby was full.' : `Crashed in the lobby. Needed ${needLabel}.`;
-    return r;
+// The day team takes over whoever is left in the rooms.
+function resolveAtHandover(p) {
+  const need = p.truth;
+  if (isTreating(p)) {
+    const skill = skillOf(S.team[p.loc], p.area);
+    const time = (100 - p.progress) * TREAT_TIME[p.loc] / (100 * SKILL_SPEED[skill]);
+    const sEnd = p.s - DRAIN[need] * G.cfg.drain * SKILL_CARE[skill] * time;
+    p.where = p.loc;
+    p.doctor = S.team[p.loc];
+    p.over = ROOMS[p.loc].rank > CAT_RANK[need];
+    p.outcome = sEnd > 0 ? 'saved' : 'died';
+    if (p.outcome === 'died') p.needAtDeath = need;
+    return;
   }
-  if (p.status !== 'placed') {
-    r.kind = 'lost';
-    if (need === 'green') { r.survived = true; r.kind = 'ok'; r.why = 'Never placed, but stable. Went home in the morning.'; }
-    else if (need === 'orange' && p.stab > 40) { r.survived = true; r.kind = 'under'; r.why = `Left in the lobby all night. Lucky. Needed ${needLabel}.`; }
-    else r.why = `Never placed. Needed ${needLabel}.`;
-    return r;
-  }
-
-  const gap = CAT_RANK[need] - ROOMS[p.room].rank;
-  if (gap <= 0) {
-    if (p.placeStab >= 15) {
-      r.survived = true;
-      r.kind = gap === 0 ? 'correct' : 'over';
-      r.why = gap === 0 ? 'Right room, in time.' : `Survived, but only needed ${needLabel}. Wasted a ${ROOMS[p.room].label} bed.`;
-    } else {
-      r.kind = 'late';
-      r.why = 'Right call, but too late. Crashed before treatment.';
-    }
-  } else if (gap === 1 && need === 'orange' && !p.inj.pen && !p.inj.major && p.placeStab >= 70) {
-    r.survived = true;
-    r.kind = 'under';
-    r.why = `Under-triaged. Needed ${needLabel}, but pulled through.`;
-  } else {
-    r.kind = 'under';
-    r.why = gap === 2 ? 'Critical patient sent to Waiting. No doctor saw them in time.'
-      : `Under-triaged. Needed ${needLabel} and couldn't wait.`;
-  }
-  return r;
+  p.where = 'handover';
+  if (need === 'green' || (need === 'orange' && p.s > 70)) p.outcome = 'saved';
+  else { p.outcome = 'died'; p.needAtDeath = need; }
 }
 
 function endNight() {
   G.state = 'ended';
   Input.cancel();
   select(null);
+  for (const p of G.patients) if (p.loc && !p.outcome) resolveAtHandover(p);
   render();
-  banner('08:00 · SHIFT OVER', 'Counting the survivors…', true);
-  setTimeout(showResults, 1500);
+  banner('HANDOVER', 'The day team takes over. Counting the survivors…', true);
+  const night = G.patients;
+  setTimeout(() => { if (G.state === 'ended' && G.patients === night) showResults(); }, 1500);
+}
+
+// The sign that decided where the patient belonged, in plain words.
+function keySign(p) {
+  const v = p.vitals;
+  const crit = VITALS.find((d) => v[d.k] === 2);
+  if (crit) return `${crit.label} ${crit.words[2].toLowerCase()}`;
+  if (p.inj.pen && v.pulse >= 1) return 'torso wound + fast pulse';
+  const warn = VITALS.find((d) => v[d.k] === 1);
+  if (warn) return `${warn.label} ${warn.words[1].toLowerCase()}`;
+  if (p.inj.pen) return 'torso wound';
+  if (p.inj.major) return 'major injury';
+  return 'all signs fine';
+}
+
+function explain(p) {
+  const need = p.outcome === 'died' ? p.needAtDeath : p.truth;
+  const needLabel = `${ROOMS[CAT_ROOM[need]].label} (${keySign(p)})`;
+  const docNote = () => {
+    if (!p.doctor) return '';
+    const d = docDef(p.doctor);
+    const sk = skillOf(p.doctor, p.area);
+    return sk === 1 ? ` ${d.name} is weak with ${AREAS[p.area].label.toLowerCase()} injuries.` : '';
+  };
+  if (p.outcome === 'saved') {
+    if (p.where === 'home') return 'Minor injury. Went home.';
+    if (p.where === 'handover') return need === 'green' ? 'Minor injury. Seen by the day team.' : `Survived until handover. Needed ${needLabel}.`;
+    const doc = docDef(p.doctor).name;
+    return p.over ? `Survived, but only needed ${needLabel}. Took a ${ROOMS[p.where].label} bed.` : `Treated in ${ROOMS[p.where].label} by ${doc}.`;
+  }
+  switch (p.where) {
+    case 'door': return 'Died outside. The lobby was full.';
+    case 'lobby': return `Died in the lobby. Needed ${needLabel}.`;
+    case 'handover': return `Still in the wrong place at handover. Needed ${needLabel}.`;
+    case 'resus': case 'ward': case 'waiting':
+      if (ROOMS[p.where].rank >= CAT_RANK[need]) return `Died during treatment in ${ROOMS[p.where].label}. Too unstable when they got there.${docNote()}`;
+      return `Died in ${ROOMS[p.where].label}. Needed ${needLabel}.`;
+    default: return `Needed ${needLabel}.`;
+  }
 }
 
 function showResults() {
-  const results = G.patients.map(evaluate);
-  const n = results.length;
-  const saved = results.filter((r) => r.survived).length;
+  const list = G.patients;
+  const n = list.length;
+  const saved = list.filter((p) => p.outcome === 'saved').length;
   const rate = n ? saved / n : 0;
   const pass = rate >= PASS_RATE;
-  const count = (k) => results.filter((r) => r.kind === k).length;
+  const placed = list.filter((p) => p.firstRoom);
+  const right = placed.filter((p) => CAT_ROOM[p.firstNeed] === p.firstRoom).length;
+  const under = placed.filter((p) => ROOMS[p.firstRoom].rank < CAT_RANK[p.firstNeed]).length;
+  const over = list.filter((p) => p.over).length;
+  const lost = list.filter((p) => p.outcome === 'died' && (p.where === 'lobby' || p.where === 'door')).length;
+  const accuracy = placed.length ? Math.round(100 * right / placed.length) : 0;
 
-  if (pass && G.night >= G.unlocked) {
-    G.unlocked = G.night + 1;
-    Store.set('night', G.unlocked);
+  G.earned = 0;
+  if (pass) {
+    G.earned = saved * 10 + (rate === 1 ? 50 : 0);
+    S.funds += G.earned;
+    if (G.night >= S.unlocked) S.unlocked = G.night + 1;
+    save();
   }
 
   $('.res-head').classList.toggle('failed', !pass);
-  $('#res-night').textContent = `NIGHT ${G.night} · 08:00`;
+  $('#res-night').textContent = `NIGHT ${G.night} · HANDOVER`;
   $('#res-big').textContent = `${saved}/${n}`;
   $('#res-bar').style.width = '0';
   requestAnimationFrame(() => requestAnimationFrame(() => { $('#res-bar').style.width = (rate * 100) + '%'; }));
   $('#res-grade').textContent =
-    rate === 1 ? 'Perfect shift. Every patient made it.'
-      : rate >= 0.9 ? 'Excellent triage. Next night unlocked.'
-        : pass ? 'Solid shift. Next night unlocked.'
-          : `Too many losses. Save ${Math.round(PASS_RATE * 100)}% to move on.`;
+    (rate === 1 ? 'Perfect shift. Every patient made it.'
+      : rate >= 0.9 ? 'Excellent triage.'
+        : pass ? 'Solid shift.'
+          : `Too many losses. Save ${Math.round(PASS_RATE * 100)}% to move on.`)
+    + (pass ? ` +💰${G.earned}` : '');
 
-  const lost = results.filter((r) => r.p.status === 'died' || r.p.status === 'dying').length;
-  const placed = results.filter((r) => r.p.status === 'placed').length;
-  const accuracy = placed ? Math.round(100 * results.filter((r) => r.p.status === 'placed' && CAT_ROOM[r.need] === r.p.room).length / placed) : 0;
   $('#res-chips').innerHTML = [
-    `🎯 ${accuracy}% triage accuracy`,
-    `✔ ${count('correct')} right calls`,
-    `⬆ ${count('over')} over-triaged`,
-    `⬇ ${count('under')} under-triaged`,
+    `🎯 ${accuracy}% first calls right`,
+    `⬆ ${over} over-triaged`,
+    `⬇ ${under} under-triaged`,
     `✝ ${lost} died waiting`,
   ].map((s) => `<span>${s}</span>`).join('');
 
   const roomTag = (room) => room
     ? `<span class="tag t-${room}">${ROOMS[room].label.toUpperCase()}</span>`
     : '<span class="tag t-none">NOT PLACED</span>';
-  const list = $('#res-list');
-  list.innerHTML = results.map((r, i) => {
-    const v = r.p.vitals;
-    return `<li class="res ${r.survived ? '' : 'bad'}" style="animation-delay:${Math.min(i * 45, 1800)}ms">
-      <div class="res-ico">${CAUSES[r.p.cause].icon}</div>
-      <div class="res-name">${r.p.name}, ${r.p.age} <small>${r.p.inj.name}</small></div>
-      <div class="res-out">${r.survived ? '✔' : '✝'}</div>
-      <div class="res-vit">${vitalsText(v)}${r.p.inj.pen ? ' · torso wound' : ''}${r.p.inj.major ? ' · major injury' : ''}</div>
-      <div class="res-why">${roomTag(r.p.room)}${r.why}</div>
-    </li>`;
-  }).join('');
-  list.scrollTop = 0;
+  const ul = $('#res-list');
+  ul.innerHTML = list.map((p, i) => `<li class="res ${p.outcome === 'saved' ? '' : 'bad'}" style="animation-delay:${Math.min(i * 45, 1800)}ms">
+      <div class="res-ico">${CAUSES[p.cause].icon}</div>
+      <div class="res-name">${p.name}, ${p.age} <small>${p.inj.name}</small></div>
+      <div class="res-out">${p.outcome === 'saved' ? '✔' : '✝'}</div>
+      <div class="res-vit">${vitalsText(p.vitals)}${p.inj.pen ? ' · torso wound' : ''}${p.inj.major ? ' · major injury' : ''}</div>
+      <div class="res-why">${roomTag(p.firstRoom)}${explain(p)}</div>
+    </li>`).join('');
+  ul.scrollTop = 0;
 
   const next = nightConfig(pass ? G.night + 1 : G.night);
   $('#res-next').textContent = pass
     ? `Next, night ${G.night + 1}: ${describeNight(next).join(' · ')}`
     : `Retry night ${G.night}: ${describeNight(next).slice(0, 3).join(' · ')}`;
   const btn = $('#btn-continue');
-  btn.textContent = pass ? `Start night ${G.night + 1} ▶` : `Retry night ${G.night} ↻`;
+  btn.textContent = pass ? 'Upgrades ▶' : `Retry night ${G.night} ↻`;
   btn.className = pass ? 'btn primary' : 'btn danger';
-  btn.onclick = () => { if (pass) G.night++; startNight(); };
+  btn.onclick = () => {
+    if (pass) { G.night++; openShop(() => openTeam()); } else openTeam();
+  };
   showScreen('results');
+}
+
+/* ---------------- team screen ---------------- */
+
+function openTeam() {
+  G.forecast = G.night === 1 ? FORECASTS[0] : pick(FORECASTS);
+  const hired = DOCTORS.filter((d) => S.doctors[d.id].hired).map((d) => d.id);
+  if (!hired.includes(S.team.resus)) S.team.resus = hired[0];
+  if (!hired.includes(S.team.ward) || S.team.ward === S.team.resus) S.team.ward = hired.find((id) => id !== S.team.resus);
+  $('#team-night').textContent = G.night;
+  $('#forecast').innerHTML = `<small>TONIGHT'S FORECAST</small><b>${G.forecast.title}</b><span>${G.forecast.text}</span>`
+    + (G.forecast.areas.length ? `<div class="fc-tags">${G.forecast.areas
+      .map((a) => `<em>${AREAS[a].icon} ${AREAS[a].label} skills needed</em>`).join('')}</div>` : '');
+  renderTeam();
+  showScreen('team');
+}
+
+function renderTeam() {
+  $('#team-resus').textContent = docDef(S.team.resus).name;
+  $('#team-ward').textContent = docDef(S.team.ward).name;
+  $('#team-list').innerHTML = DOCTORS.filter((d) => S.doctors[d.id].hired).map((d) => {
+    const sk = S.doctors[d.id].skills;
+    const role = S.team.resus === d.id ? 'resus' : S.team.ward === d.id ? 'ward' : '';
+    return `<div class="doc ${role ? 'on-' + role : ''}">
+      <div class="doc-head"><b>${d.name}</b><small>${d.role}</small></div>
+      <div class="doc-skills">${Object.keys(AREAS).map((a) => `<span><i>${AREAS[a].icon} ${AREAS[a].label}</i><b class="st st-${sk[a]}">${stars(sk[a])}</b></span>`).join('')}</div>
+      <div class="doc-btns">
+        <button class="pill p-resus ${role === 'resus' ? 'on' : ''}" data-assign="resus" data-doc="${d.id}">Resus</button>
+        <button class="pill p-ward ${role === 'ward' ? 'on' : ''}" data-assign="ward" data-doc="${d.id}">Ward</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function assign(room, id) {
+  const other = room === 'resus' ? 'ward' : 'resus';
+  if (S.team[other] === id) S.team[other] = S.team[room];   // swap
+  S.team[room] = id;
+  save();
+  renderTeam();
+}
+
+/* ---------------- upgrade shop ---------------- */
+
+let shopDone = null;
+
+function openShop(after) {
+  shopDone = after || (() => { refreshStart(); showScreen('start'); });
+  renderShop();
+  showScreen('shop');
+}
+
+function renderShop() {
+  $('#shop-funds').textContent = S.funds;
+  const item = (icon, title, desc, cost, action, done) => `<div class="shop-item">
+      <div class="si-ico">${icon}</div>
+      <div class="si-main"><b>${title}</b><small>${desc}</small></div>
+      ${done ? '<span class="si-max">MAX</span>'
+        : `<button class="buy" data-buy="${action}" ${S.funds < cost ? 'disabled' : ''}>💰${cost}</button>`}
+    </div>`;
+  const rb = S.beds.resus - BASE_BEDS.resus;
+  const wb = S.beds.ward - BASE_BEDS.ward;
+  const next = ANALYSIS[S.analysis + 1];
+  let html = '<h3>Hospital</h3>'
+    + item('🛏️', `Resus bed (${S.beds.resus} now)`, 'Another bed for critical patients.', UPGRADE_COSTS.resusBed[rb], 'resusBed', rb >= UPGRADE_COSTS.resusBed.length)
+    + item('🛏️', `Ward bed (${S.beds.ward} now)`, 'Another bed for urgent patients.', UPGRADE_COSTS.wardBed[wb], 'wardBed', wb >= UPGRADE_COSTS.wardBed.length)
+    + item('🔬', next ? next.name : ANALYSIS[S.analysis].name, next ? next.desc : 'Best analysis bought.', next ? next.cost : 0, 'analysis', !next)
+    + `<p class="hint">Analysis now: <b>${ANALYSIS[S.analysis].name}</b>. ${ANALYSIS[S.analysis].desc}</p>`
+    + '<h3>Doctors</h3>';
+  for (const d of DOCTORS) {
+    const st = S.doctors[d.id];
+    if (!st.hired) {
+      html += item('🩺', `Hire ${d.name}`, `${d.role}: ${Object.keys(AREAS).map((a) => `${AREAS[a].icon}${d.skills[a]}`).join(' ')}`, d.cost, 'hire:' + d.id, false);
+      continue;
+    }
+    html += `<div class="shop-doc"><b>${d.name}</b> <small>${d.role}</small><div class="train">${Object.keys(AREAS).map((a) => `
+      <button class="train-btn" data-buy="train:${d.id}:${a}" ${st.skills[a] >= 3 || S.funds < UPGRADE_COSTS.train ? 'disabled' : ''}>
+        <i>${AREAS[a].icon} ${AREAS[a].label}</i><b class="st st-${st.skills[a]}">${stars(st.skills[a])}</b>
+        <small>${st.skills[a] >= 3 ? 'expert' : 'train 💰' + UPGRADE_COSTS.train}</small>
+      </button>`).join('')}</div></div>`;
+  }
+  $('#shop-list').innerHTML = html;
+}
+
+function buy(action) {
+  const [kind, a, b] = action.split(':');
+  let cost = 0;
+  if (kind === 'resusBed') cost = UPGRADE_COSTS.resusBed[S.beds.resus - BASE_BEDS.resus];
+  if (kind === 'wardBed') cost = UPGRADE_COSTS.wardBed[S.beds.ward - BASE_BEDS.ward];
+  if (kind === 'analysis') cost = ANALYSIS[S.analysis + 1] ? ANALYSIS[S.analysis + 1].cost : undefined;
+  if (kind === 'hire') cost = docDef(a).cost;
+  if (kind === 'train') cost = S.doctors[a].skills[b] < 3 ? UPGRADE_COSTS.train : undefined;
+  if (cost === undefined || S.funds < cost) return;
+  S.funds -= cost;
+  if (kind === 'resusBed') S.beds.resus++;
+  if (kind === 'wardBed') S.beds.ward++;
+  if (kind === 'analysis') S.analysis++;
+  if (kind === 'hire') S.doctors[a].hired = true;
+  if (kind === 'train') S.doctors[a].skills[b]++;
+  save();
+  Sound.place();
+  renderShop();
 }
 
 /* ---------------- menu ---------------- */
 
 function refreshStart() {
-  G.night = Math.min(Math.max(G.night, 1), G.unlocked);
+  G.night = Math.min(Math.max(G.night, 1), S.unlocked);
   $('#start-night').textContent = G.night;
   $('#btn-prev').disabled = G.night <= 1;
-  $('#btn-next').disabled = G.night >= G.unlocked;
+  $('#btn-next').disabled = G.night >= S.unlocked;
   const feats = describeNight(nightConfig(G.night)).map((f) => `<li>${f}</li>`);
-  if (G.night === G.unlocked) feats.push(`<li class="locked">Save ${Math.round(PASS_RATE * 100)}% to unlock night ${G.night + 1}</li>`);
+  if (G.night === S.unlocked) feats.push(`<li class="locked">Save ${Math.round(PASS_RATE * 100)}% to unlock night ${G.night + 1}</li>`);
   $('#start-features').innerHTML = feats.join('');
   $('#btn-start').textContent = `Start night ${G.night}`;
+  $('#start-funds').textContent = `💰${S.funds}`;
 }
 
 function updateSoundBtn() { $('#btn-sound').textContent = Sound.on ? '🔊' : '🔇'; }
 
 function init() {
-  Input.init($('#lobby'), {
-    tap(id) {
+  Input.init($('#screen-game'), {
+    tap(id, el) {
       const p = G.patients[id];
-      if (!p || p.status !== 'lobby') return;
+      if (!p || p.outcome || G.state !== 'play') return;
+      // With a patient already selected, tapping a token inside a room means "put them here".
+      if (el.classList.contains('tok') && G.selected && G.selected !== p) return;
       select(G.selected === p ? null : p);
     },
-    drop(id, room, ghost) { return place(G.patients[id], room, ghost); },
+    drop(id, room, ghost) { return move(G.patients[id], room, ghost); },
     dragStart() { select(null); },
   });
   document.querySelectorAll('.room').forEach((el) => {
-    el.addEventListener('click', () => { if (G.selected) place(G.selected, el.dataset.room); });
+    el.addEventListener('click', () => { if (G.selected) move(G.selected, el.dataset.room); });
   });
 
-  $('#btn-start').addEventListener('click', startNight);
+  $('#btn-start').addEventListener('click', () => { Sound.ensure(); openTeam(); });
+  $('#btn-go').addEventListener('click', startNight);
+  $('#btn-team-back').addEventListener('click', () => { refreshStart(); showScreen('start'); });
+  $('#team-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-assign]');
+    if (b) assign(b.dataset.assign, b.dataset.doc);
+  });
+  $('#btn-shop').addEventListener('click', () => openShop());
+  $('#shop-list').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-buy]');
+    if (b && !b.disabled) buy(b.dataset.buy);
+  });
+  $('#btn-shop-done').addEventListener('click', () => shopDone());
   $('#btn-prev').addEventListener('click', () => { G.night--; refreshStart(); });
   $('#btn-next').addEventListener('click', () => { G.night++; refreshStart(); });
   $('#btn-rules').addEventListener('click', () => showScreen('rules'));
   $('#btn-rules-back').addEventListener('click', () => showScreen('start'));
+  $('#btn-reset').addEventListener('click', () => {
+    S = defaultSave();
+    save();
+    G.night = 1;
+    refreshStart();
+  });
   $('#btn-menu').addEventListener('click', () => { refreshStart(); showScreen('start'); });
+  $('#btn-handover').addEventListener('click', () => { if (G.state === 'play' && !pendingInLobby()) endNight(); });
   $('#btn-pause').addEventListener('click', pause);
   $('#btn-resume').addEventListener('click', resume);
   $('#btn-quit').addEventListener('click', () => { G.state = 'menu'; refreshStart(); showScreen('start'); });

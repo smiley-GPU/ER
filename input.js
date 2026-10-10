@@ -1,5 +1,6 @@
 'use strict';
-// One-finger input: drag a patient card onto a room, or tap a card then tap a room.
+// One-finger input: drag a patient (lobby card or room token) onto a room,
+// or tap a patient and then tap a room.
 
 const Input = (() => {
   const DRAG_THRESHOLD = 8;
@@ -12,16 +13,16 @@ const Input = (() => {
   }
 
   function onDown(e) {
-    const card = e.target.closest('.card');
-    if (!card || card.classList.contains('dead') || drag) return;
+    const el = e.target.closest('[data-drag]');
+    if (!el || el.classList.contains('dead') || drag) return;
     e.preventDefault();
-    const r = card.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
     drag = {
-      id: +card.dataset.id, el: card, pid: e.pointerId,
+      id: +el.dataset.id, el, pid: e.pointerId,
       sx: e.clientX, sy: e.clientY, offX: e.clientX - r.left, offY: e.clientY - r.top,
       w: r.width, h: r.height, active: false, hover: null, ghost: null,
     };
-    try { card.setPointerCapture(e.pointerId); } catch (_) { /* window listeners still catch it */ }
+    try { el.setPointerCapture(e.pointerId); } catch (_) { /* window listeners still catch it */ }
   }
 
   function begin(x, y) {
@@ -62,7 +63,7 @@ const Input = (() => {
     if (!drag || e.pointerId !== drag.pid) return;
     const d = drag;
     drag = null;
-    if (!d.active) { if (handlers.tap) handlers.tap(d.id); return; }
+    if (!d.active) { if (handlers.tap) handlers.tap(d.id, d.el); return; }
     if (d.hover) d.hover.classList.remove('drop-hover');
     d.el.classList.remove('dragging');
     const room = d.hover ? d.hover.dataset.room : null;
@@ -90,9 +91,9 @@ const Input = (() => {
 
   function cancelIf(id) { if (drag && drag.id === id) cancel(); }
 
-  function init(lobbyEl, h) {
+  function init(rootEl, h) {
     handlers = h;
-    lobbyEl.addEventListener('pointerdown', onDown);
+    rootEl.addEventListener('pointerdown', onDown);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', cancel);

@@ -13,3 +13,12 @@ You can look for more information, but base it on similar sources as you can fin
 Make it a graphic and moving, fast paced game. Patients are arriving, and if you don't react they just stay without care in the lobby. 
 Use hospital colors: white, red, hospital green. Make it clear for players to what happens in each sector.
 This is a little bit like tetris, but also not like it.
+
+======= UPDATE
+
+make it slower. Increase difficulty by making harder cases. take away the stability bar, but make there another way to show decreasing stability - check source materials.
+make it possible to change customer placement.
+make it possible for player to choose the doctor team for the shift.
+doctors should have skills for different injuries that affect speed and survivability rate.
+always let player handle all patients that have arrived during the shift, even if time ends.
+make upgrades after succesfull nights: more beads, better doctors, better instant analysis.
