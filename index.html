@@ -85,13 +85,22 @@
         <li>Untreated patients slide into shock: their <b>signs get worse step by step</b>. Someone who needed the Ward can end up needing Resus.</li>
         <li>The <b>❤ heart</b> on each card beats faster as they weaken. A flashing red <b>monitor alarm</b> means they're about to crash.</li>
         <li><b>⏱</b> shows how long they've been waiting.</li>
-        <li>A <b>?</b> sign hasn't been measured yet. Wait a moment, or buy better analysis.</li>
+        <li>A <b>?</b> sign hasn't been measured yet. Wait, send them to a nurse, or buy better analysis.</li>
+        <li>Care works the other way: once treatment takes hold, <b>signs get better</b> and flash green. A green ring on a token means the patient is improving.</li>
+      </ul>
+
+      <h3>Nurses in Waiting</h3>
+      <ul class="plain">
+        <li>Each nurse looks after <b>2 patients</b> in Waiting (marked <b>✚</b>). They measure unknown signs within a second and give basic care.</li>
+        <li>Basic care keeps <b>urgent</b> patients steady and wins back signs they lost while waiting. <b>Critical</b> patients still get worse, only more slowly: nurses buy time when Resus is full.</li>
+        <li>Nurses don't cure anyone. Urgent patients only count as saved at handover if they're still in good shape.</li>
       </ul>
 
       <h3>Rooms and doctors</h3>
       <ul class="plain">
         <li>Patients in a room appear as round tokens. The ring fills as treatment progresses. <b>Drag a token</b> (or tap it, then tap a room) to move the patient. Moving restarts their treatment.</li>
-        <li>Each room has one lead doctor. Doctors are rated 1–3 in <b>Wounds, Head, Bones and Burns</b>. A skilled doctor treats faster and keeps the patient more stable.</li>
+        <li>Doctors are rated 1–3 in <b>Wounds, Head, Bones and Burns</b>. A skilled doctor treats faster and keeps the patient more stable.</li>
+        <li>A room can have <b>several doctors</b>. Each patient gets the best one for their injury. One doctor treats up to 3 patients at full speed; with more patients, everyone in the room is treated more slowly.</li>
         <li>A patient in a room below what they need gets <b>no treatment</b> and keeps getting worse. A patient in a room above what they need survives, but blocks a scarce bed.</li>
         <li>At 08:00 no more patients arrive, but you must still place everyone who came in. Then hand over to the day team.</li>
         <li>Save <b>80%</b> to unlock the next night and earn funds for upgrades.</li>
@@ -105,7 +114,7 @@
     <div class="start-inner">
       <h2 class="scr-title">Night <span id="team-night">1</span>: pick your team</h2>
       <div class="forecast" id="forecast"></div>
-      <p class="hint">Choose one lead doctor for each room. Stars show skill: more stars means faster treatment and safer patients.</p>
+      <p class="hint" id="team-hint"></p>
       <div class="team-slots">
         <div class="team-slot ts-resus"><small>RESUS / ICU</small><b id="team-resus">–</b></div>
         <div class="team-slot ts-ward"><small>WARD</small><b id="team-ward">–</b></div>
@@ -146,8 +155,11 @@
     <div class="bay" id="bay">
       <span class="siren"></span>
       <span class="ticker" id="ticker">Ambulance bay quiet…</span>
-      <span class="door" id="door"></span>
-      <button class="handover" id="btn-handover">Hand over ▶</button>
+      <div class="drive" id="drive">
+        <span class="er-door">ER</span>
+        <span class="door" id="door"></span>
+        <button class="handover" id="btn-handover">Hand over ▶</button>
+      </div>
     </div>
 
     <div class="lobby-wrap">
@@ -168,7 +180,7 @@
         <div class="beds" id="beds-ward"></div>
       </div>
       <div class="room room-wait" data-room="waiting">
-        <div class="room-head"><b>WAITING</b><small>No doctor</small></div>
+        <div class="room-head"><b>WAITING</b><small id="doc-waiting">Nurse</small></div>
         <div class="room-rule">All signs fine · minor injury</div>
         <div class="waiting-box" id="waiting-list"></div>
       </div>
@@ -203,6 +215,7 @@
 
 </div>
 <script src="data.js"></script>
+<script src="art.js"></script>
 <script src="input.js"></script>
 <script src="game.js"></script>
 </body>

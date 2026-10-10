@@ -124,8 +124,10 @@ const UPGRADE_COSTS = {
   resusBed: [150, 220, 300],      // 2 -> 5 beds
   wardBed: [90, 140, 200],        // 3 -> 6 beds
   train: 70,                      // +1 skill in one area
+  nurse: [80, 140],               // 1 -> 3 nurses in Waiting
 };
 const BASE_BEDS = { resus: 2, ward: 3 };
+const BASE_NURSES = 1;
 
 // Instant analysis at triage. Hidden signs show "?" until measured.
 const ANALYSIS = [
@@ -192,6 +194,13 @@ function genVitals(target, inj, tricky) {
 
 // Shock progression while untreated (Bara.md: rising pulse, falling BP, then the brain and
 // breathing fail). Worsens one sign by one step; returns the sign that changed.
+// The opposite: basic or full treatment brings the worst sign down one step.
+function improveOnce(v) {
+  const k = Object.keys(v).filter((key) => v[key] > 0).sort((a, b) => v[b] - v[a])[0];
+  if (k) v[k]--;
+  return k || null;
+}
+
 function worsenOnce(v, inj) {
   const order = (inj.red || ['bp']).concat(['pulse', 'bp', 'mind', 'oxy']);
   for (const k of order) if (v[k] < 2) { v[k]++; return k; }
